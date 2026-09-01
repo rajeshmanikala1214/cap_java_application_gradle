@@ -1,0 +1,9 @@
+{
+	"resources": {
+		"includes": [
+			{
+				"pattern": "\\Qindices-h2.sql\\E"
+			}
+		]
+	}
+}

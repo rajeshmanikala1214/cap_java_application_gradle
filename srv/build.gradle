@@ -1,0 +1,92 @@
+// ===========================================================================
+// :srv  -  replaces srv/pom.xml (my:bookshop, packaging jar)
+// ===========================================================================
+
+plugins {
+    id 'java'
+    id 'jacoco'
+    id 'org.springframework.boot'
+    id 'io.spring.dependency-management'
+}
+
+apply from: rootProject.file('gradle/java-conventions.gradle')
+apply from: rootProject.file('gradle/cds.gradle')
+
+// Maven: <finalName>bookshop</finalName>
+base {
+    archivesName = 'bookshop'
+}
+
+// ---------------------------------------------------------------------------
+// Dependencies - a 1:1 transcription of srv/pom.xml <dependencies>.
+// Versions come from the BOMs imported in gradle/java-conventions.gradle,
+// except where the pom pinned one explicitly.
+//   Maven compile scope  -> implementation
+//   Maven runtime scope  -> runtimeOnly
+//   Maven test scope     -> testImplementation
+//   Maven <optional>     -> developmentOnly (Spring Boot's own convention)
+// ---------------------------------------------------------------------------
+dependencies {
+    // --- CDS ---
+    implementation 'com.sap.cds:cds-starter-spring-boot'
+    runtimeOnly 'com.sap.cds:cds-adapter-odata-v4'
+    runtimeOnly 'com.sap.cds:cds-starter-cloudfoundry'
+    runtimeOnly 'com.sap.cds:cds-starter-k8s'
+    runtimeOnly 'com.sap.cds:cds-feature-enterprise-messaging'
+    runtimeOnly 'com.sap.cds:cds-feature-remote-odata'
+    runtimeOnly 'com.sap.cds:cds-feature-change-tracking'
+    // pom pinned this one outside the BOM: ${cds-feature-attachments.version}
+    runtimeOnly "com.sap.cds:cds-feature-attachments:${cdsFeatureAttachmentsVersion}"
+
+    // --- SAP Cloud SDK ---
+    implementation 'com.sap.cloud.sdk.cloudplatform:resilience'
+    implementation 'com.sap.cloud.sdk:sdk-core'
+    implementation 'com.sap.cloud.sdk.cloudplatform:connectivity-apache-httpclient4'
+
+    // --- databases ---
+    runtimeOnly 'com.h2database:h2'
+    runtimeOnly 'org.xerial:sqlite-jdbc'
+
+    // --- Cloud Foundry logging (versions pinned in the pom) ---
+    implementation "com.sap.hcp.cf.logging:cf-java-logging-support-servlet:${cfJavaLoggingSupportVersion}"
+    implementation "com.sap.hcp.cf.logging:cf-java-logging-support-logback:${cfJavaLoggingSupportVersion}"
+
+    // --- Spring Boot ---
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+    // --- tests ---
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.security:spring-security-test'
+    testImplementation 'org.springframework.boot:spring-boot-starter-webflux'
+
+    // --- dev tools (<optional>true</optional> in the pom) ---
+    developmentOnly 'org.springframework.boot:spring-boot-devtools'
+}
+
+// ---------------------------------------------------------------------------
+// Packaging - spring-boot-maven-plugin repackage with <classifier>exec</classifier>.
+//
+// Maven produced two artifacts in target/:
+//   bookshop.jar        (plain jar, what integration-tests depended on)
+//   bookshop-exec.jar   (repackaged executable jar, what mta.yaml deploys)
+//
+// Gradle's Boot plugin defaults would give the fat jar the plain name, so both
+// tasks are configured explicitly. archiveVersion is cleared to reproduce
+// Maven's <finalName>, which also left the version out of the file name.
+// ---------------------------------------------------------------------------
+tasks.named('jar') {
+    enabled = true
+    archiveClassifier = ''
+    archiveVersion = ''
+}
+
+tasks.named('bootJar') {
+    archiveClassifier = 'exec'
+    archiveVersion = ''
+}
+
+// `assemble`/`build` must produce both, exactly as `mvn package` did.
+tasks.named('assemble') {
+    dependsOn tasks.named('jar'), tasks.named('bootJar')
+}

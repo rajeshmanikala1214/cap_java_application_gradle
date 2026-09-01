@@ -1,0 +1,39 @@
+# Replaces .github/workflows/maven.yml.
+# The Maven workflow ran: mvn -ntp -B clean install  on JDK 25.
+# This one runs the Gradle equivalent on JDK 21, matching jdk.version from the
+# original pom.xml and the Java toolchain configured in the Gradle build.
+
+name: Java CI with Gradle
+
+on:
+  push:
+    branches:
+      - main
+      - postgres
+  pull_request:
+    branches:
+      - main
+      - postgres
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Set up JDK
+      uses: actions/setup-java@v5
+      with:
+        java-version: 21
+        distribution: 'sapmachine'
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+    - name: Build with Gradle
+      run: ./gradlew --no-daemon -PuseSystemNode=true clean build

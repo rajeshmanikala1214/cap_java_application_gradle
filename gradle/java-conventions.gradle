@@ -1,0 +1,106 @@
+// ===========================================================================
+// Shared Java configuration, applied by each Java module.
+//
+// Replaces what the modules inherited from the parent pom:
+//   - <parent>spring-boot-starter-parent 3.5.14</parent>  -> spring-boot-dependencies BOM
+//   - <dependencyManagement> 3 imported BOMs              -> mavenBom imports below
+//   - maven-compiler-plugin 3.15.0 (release 21, UTF-8)    -> toolchain + compile options
+//   - maven-surefire-plugin 3.5.6 (failIfNoTests=true)    -> test task
+//   - jacoco-maven-plugin 0.8.12 (prepare-agent, report)  -> jacoco plugin
+//   - spotless-maven-plugin 3.6.0 (google-java-format)    -> gradle/spotless.gradle
+// ===========================================================================
+
+// Read once into a local, because a bare `javaVersion` inside a task-scoped
+// closure can resolve to Gradle's own JavaVersion type instead of this
+// project property.
+def targetJavaVersion = Integer.parseInt(project.property('javaVersion').toString())
+
+// maven-compiler-plugin: <release>${jdk.version}</release>, <encoding>UTF-8</encoding>
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = targetJavaVersion
+}
+
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+tasks.withType(org.gradle.api.tasks.testing.Test).configureEach {
+    systemProperty 'file.encoding', 'UTF-8'
+}
+
+// ---------------------------------------------------------------------------
+// Dependency management.
+//
+// io.spring.dependency-management reproduces Maven <dependencyManagement>
+// semantics (constraints apply to every configuration, exactly as an imported
+// BOM does in Maven) rather than Gradle's platform() which only reaches
+// configurations that extend the one it is declared on.
+// ---------------------------------------------------------------------------
+dependencyManagement {
+    imports {
+        // was: <parent>org.springframework.boot:spring-boot-starter-parent:3.5.14</parent>
+        mavenBom "org.springframework.boot:spring-boot-dependencies:${springBootVersion}"
+        // was: com.sap.cds:cds-services-bom:${cds.services.version} (import)
+        mavenBom "com.sap.cds:cds-services-bom:${cdsServicesVersion}"
+        // was: com.sap.cloud.sdk:sdk-modules-bom:${cloud.sdk.version} (import)
+        mavenBom "com.sap.cloud.sdk:sdk-modules-bom:${cloudSdkVersion}"
+        // was: com.sap.cloud.security:java-bom:${xsuaa.version} (import)
+        mavenBom "com.sap.cloud.security:java-bom:${xsuaaVersion}"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests. Surefire's default includes (**/Test*.java, **/*Test.java,
+// **/*Tests.java, **/*TestCase.java) are a subset of what Gradle's test task
+// discovers via the JUnit Platform, so no include patterns are needed here.
+// Failsafe's *IT classes are handled separately in :integration-tests.
+// ---------------------------------------------------------------------------
+tasks.named('test') {
+    useJUnitPlatform()
+    // maven-surefire-plugin <failIfNoTests>true</failIfNoTests> (root pom).
+    // Guarded because the property only exists on Gradle 8.13+.
+    if (it.hasProperty('failOnNoDiscoveredTests')) {
+        it.failOnNoDiscoveredTests = true
+    }
+    testLogging {
+        events 'failed'
+        exceptionFormat = 'full'
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JaCoCo. Maven ran prepare-agent (unit tests) and bound the XML-only report
+// to the verify phase; `gradle build` reaches it through test -> finalizedBy.
+// ---------------------------------------------------------------------------
+jacoco {
+    toolVersion = jacocoVersion
+}
+
+tasks.named('test') {
+    finalizedBy tasks.named('jacocoTestReport')
+}
+
+tasks.named('jacocoTestReport') {
+    dependsOn tasks.named('test')
+    reports {
+        // Maven: <formats><format>XML</format></formats>
+        xml.required = true
+        html.required = false
+        csv.required = false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// spotless-maven-plugin equivalent. Applied from a separate script with its own
+// buildscript block so that -PskipSpotless bypasses plugin resolution entirely.
+// ---------------------------------------------------------------------------
+if (!project.hasProperty('skipSpotless')) {
+    apply from: rootProject.file('gradle/spotless.gradle')
+}

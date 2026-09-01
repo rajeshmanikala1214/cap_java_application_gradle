@@ -1,0 +1,526 @@
+// ===========================================================================
+// cds-maven-plugin 4.9.0 equivalent for the :srv module.
+//
+// The Maven build declared six executions, reproduced here as six tasks:
+//
+//   cds.clean        -> cdsClean      (wired into `clean`)
+//   cds.install-node -> :installNode  (see gradle/node.gradle)
+//   cds.npm-ci       -> npmCi
+//   cds.resolve      -> cdsResolve
+//   cds.build        -> cdsBuild      (the three <command> entries)
+//   cds.generate     -> cdsGenerate   (com.sap.cds:cds4j-codegen)
+//
+// All cds/npm commands run with the repository root as their working directory,
+// not srv/. That is how the Maven plugin behaved: the pom passed
+// "compile srv/cat-service.cds", a path that only resolves from the root, and
+// package.json/package-lock.json live at the root.
+// ===========================================================================
+
+def cdsRoot = rootProject.projectDir
+
+// Output locations, measured from an actual `cds build --for java` run of this
+// project rather than assumed. Note csn.json lands *inside* edmx/.
+def edmxDir = file('src/main/resources/edmx')
+def csnFile = file('src/main/resources/edmx/csn.json')
+def schemaH2File = file('src/main/resources/schema-h2.sql')
+def openapiFile = file('src/main/resources/swagger/openapi.json')
+def generatedSourcesDir = layout.buildDirectory.dir('generated/sources/cds/main/java')
+
+// Every .cds file that can influence the compiled model, plus the imported
+// EDMX and the CDS configuration.
+def cdsModelInputs = files(
+        fileTree(cdsRoot) {
+            include 'db/**/*.cds', 'srv/**/*.cds', 'app/**/*.cds', 'fts/**/*.cds'
+            include 'srv/external/*.edmx'
+            exclude '**/node_modules/**'
+        },
+        rootProject.file('package.json'),
+        rootProject.file('.cdsrc.json')
+)
+
+// ---------------------------------------------------------------------------
+// Configuration holding the CAP Java code generator.
+//
+// com.sap.cds:cds4j-codegen is the module that implements the typed-accessor
+// generation behind cds:generate in CAP Java 4.x. (In CAP Java 5.0 it was
+// renamed to com.sap.cds:cds-services-code-generator - see the CAP Java
+// migration guide.) It is an ordinary Maven Central artifact, so Gradle
+// resolves it directly and no Maven tooling is involved.
+// ---------------------------------------------------------------------------
+configurations {
+    cdsCodegen {
+        canBeConsumed = false
+        canBeResolved = true
+        description = 'Classpath for the CAP Java CDS-to-Java code generator'
+    }
+}
+
+dependencies {
+    cdsCodegen "com.sap.cds:cds4j-codegen:${cdsServicesVersion}"
+}
+
+// ---------------------------------------------------------------------------
+// cds.npm-ci  ->  npm ci (installs the @sap/cds-dk version from package.json)
+// ---------------------------------------------------------------------------
+def npmCiStamp = layout.buildDirectory.file('cds/npm-ci.stamp')
+
+tasks.register('npmCi') {
+    group = 'cds'
+    description = 'Runs npm ci at the repository root (cds-maven-plugin goal: npm, arguments: ci)'
+    dependsOn rootProject.tasks.named('installNode')
+    inputs.files rootProject.file('package.json'), rootProject.file('package-lock.json')
+    outputs.file npmCiStamp
+    // npm ci wipes node_modules, so a stamp alone is not enough evidence.
+    outputs.upToDateWhen { new File(cdsRoot, 'node_modules').isDirectory() }
+
+    doLast {
+        exec {
+            workingDir cdsRoot
+            commandLine rootProject.ext.npmCommand(['ci'])
+            environment rootProject.ext.nodeAwareEnvironment()
+        }
+        def stamp = npmCiStamp.get().asFile
+        stamp.parentFile.mkdirs()
+        stamp.text = "npm ci completed at ${new Date()}\n"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cds.resolve  ->  cdsResolve
+//
+// CAP Java feature jars ship CDS models inside the jar. This project needs them:
+// srv/admin-service.cds contains
+//     using {sap.changelog as changelog} from 'com.sap.cds/change-tracking';
+//     using {sap.attachments.Attachments} from 'com.sap.cds/cds-feature-attachments';
+// and the CDS compiler reports those as "package module" references, i.e. it
+// resolves them the way Node resolves packages. Extracting the jar-side models
+// into <root>/node_modules/<groupId>/<artifactId>/ therefore makes them
+// resolvable; that placement was verified against this project's model.
+//
+// Runs after npmCi because npm ci recreates node_modules from scratch.
+// ---------------------------------------------------------------------------
+def cdsModelJarPrefixes = project.hasProperty('cdsModelJarPrefix') ?
+        [project.property('cdsModelJarPrefix').toString()] : ['cds/', 'META-INF/cds/']
+
+tasks.register('cdsResolve') {
+    group = 'cds'
+    description = 'Extracts CDS models shipped inside CAP Java dependencies (cds-maven-plugin goal: resolve)'
+    dependsOn tasks.named('npmCi')
+    inputs.files configurations.named('runtimeClasspath')
+    inputs.property 'jarPrefixes', cdsModelJarPrefixes
+    // Cheap enough to always run, and its output lives in npm-managed territory.
+    outputs.upToDateWhen { false }
+
+    doLast {
+        def target = new File(cdsRoot, 'node_modules')
+        def extractedRoots = [] as Set
+        def jarsWithModels = [] as Set
+        def diagnostics = [] as List
+
+        configurations.runtimeClasspath.files.findAll { it.name.endsWith('.jar') }.each { jarFile ->
+            def zip = new java.util.zip.ZipFile(jarFile)
+            try {
+                def containsCds = false
+                zip.entries().each { entry ->
+                    if (entry.directory || entry.name.endsWith('.class')) {
+                        return
+                    }
+                    if (entry.name.endsWith('.cds')) {
+                        containsCds = true
+                    }
+                    def prefix = cdsModelJarPrefixes.find { entry.name.startsWith(it) }
+                    if (prefix == null) {
+                        return
+                    }
+                    def relative = entry.name.substring(prefix.length())
+                    if (relative.empty || !relative.contains('/')) {
+                        return
+                    }
+                    def outFile = new File(target, relative)
+                    outFile.parentFile.mkdirs()
+                    zip.getInputStream(entry).withStream { input ->
+                        outFile.withOutputStream { out -> out << input }
+                    }
+                    extractedRoots << relative.split('/')[0]
+                    jarsWithModels << jarFile.name
+                }
+                if (containsCds && !jarsWithModels.contains(jarFile.name)) {
+                    def tops = zip.entries().collect { it.name.split('/')[0] }.unique().sort()
+                    diagnostics << "  ${jarFile.name} contains .cds files but none under ${cdsModelJarPrefixes}; top-level entries: ${tops}"
+                }
+            } finally {
+                zip.close()
+            }
+        }
+
+        // A directory only resolves as a package module if it looks like one.
+        extractedRoots.each { rootName ->
+            def packageJson = new File(target, "${rootName}/package.json")
+            if (!packageJson.isFile()) {
+                packageJson.parentFile.mkdirs()
+                packageJson.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+                        name       : rootName,
+                        version    : cdsServicesVersion,
+                        description: 'CDS models extracted from CAP Java dependencies by the cdsResolve task'
+                ]))
+            }
+        }
+
+        if (extractedRoots.isEmpty()) {
+            throw new GradleException(
+                    'cdsResolve extracted no CDS models from the runtime classpath, so the CDS build would fail on\n' +
+                    "  using ... from 'com.sap.cds/change-tracking'\n" +
+                    "  using ... from 'com.sap.cds/cds-feature-attachments'\n" +
+                    "Searched these jar prefixes: ${cdsModelJarPrefixes}\n" +
+                    (diagnostics ? "Candidate jars:\n${diagnostics.join('\n')}\n" : '') +
+                    'Override the location with -PcdsModelJarPrefix=<prefix/> once the real layout is known.')
+        }
+        logger.lifecycle("cdsResolve extracted CDS models from ${jarsWithModels.size()} jar(s) into node_modules/${extractedRoots}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cds.build  ->  cdsBuild
+// The three <command> entries from srv/pom.xml, in order and verbatim.
+// ---------------------------------------------------------------------------
+// The CDS build target. CAP 9 defaults cds.build.target to "gen", which copies
+// the whole module into gen/srv/ instead of writing the model in place. That
+// would leave csn.json/edmx out of srv/src/main/resources and therefore out of
+// the packaged Spring Boot jar, and out of reach of the code generator. The
+// Maven build wrote in place (srv/pom.xml passes
+// ${project.basedir}/src/main/resources/... for the H2 schema), so the target is
+// pinned back to the module here via CAP's documented cds.env override.
+// Verified: with this override the three commands below produce
+//   srv/src/main/resources/edmx/csn.json, schema-h2.sql and swagger/openapi.json.
+def cdsBuildEnvironment = {
+    def env = new LinkedHashMap<String, String>(rootProject.ext.nodeAwareEnvironment())
+    env['CDS_BUILD_TARGET'] = '.'
+    return env
+}
+
+tasks.register('cdsBuild') {
+    group = 'cds'
+    description = 'Runs the CDS build, H2 schema export and OpenAPI export (cds-maven-plugin goal: cds)'
+    dependsOn tasks.named('cdsResolve')
+    inputs.files cdsModelInputs
+    outputs.dir edmxDir
+    outputs.file schemaH2File
+    outputs.file openapiFile
+
+    doLast {
+        // 1) cds build --for java
+        exec {
+            workingDir cdsRoot
+            commandLine rootProject.ext.cdsCommand(['build', '--for', 'java'])
+            environment cdsBuildEnvironment()
+        }
+
+        // 2) cds deploy --to h2 --with-mocks --dry --out <srv>/src/main/resources/schema-h2.sql
+        schemaH2File.parentFile.mkdirs()
+        exec {
+            workingDir cdsRoot
+            commandLine rootProject.ext.cdsCommand(['deploy', '--to', 'h2', '--with-mocks', '--dry',
+                                                    '--out', schemaH2File.absolutePath])
+            environment cdsBuildEnvironment()
+        }
+
+        // 3) cds compile srv/cat-service.cds -2 openapi --openapi:url /api/browse > .../openapi.json
+        //    Maven expressed the redirect with a shell '>'; done here with a
+        //    captured stdout stream so no shell is involved.
+        openapiFile.parentFile.mkdirs()
+        def openapiStream = new FileOutputStream(openapiFile)
+        try {
+            exec {
+                workingDir cdsRoot
+                commandLine rootProject.ext.cdsCommand(['compile', 'srv/cat-service.cds', '-2', 'openapi',
+                                                        '--openapi:url', '/api/browse'])
+                environment cdsBuildEnvironment()
+                standardOutput = openapiStream
+            }
+        } finally {
+            openapiStream.close()
+        }
+
+        if (!csnFile.isFile()) {
+            throw new GradleException("cds build completed but ${csnFile} was not produced. " +
+                    'The CDS build target is probably not resolving to this module - check CDS_BUILD_TARGET.')
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cds.generate  ->  cdsGenerate
+//
+// Maven configuration being reproduced:
+//   <basePackage>cds.gen</basePackage>
+//   <strictSetters>true</strictSetters>
+//   <interfacesForAspects>true</interfacesForAspects>
+//   <linkedInterfaces>true</linkedInterfaces>
+//
+// The generator is invoked directly on the cds4j-codegen classpath. Its entry
+// point is discovered from the resolved jar (manifest Main-Class, else a class
+// declaring public static void main) instead of being hardcoded, and the
+// invocation can be pinned with -PcdsCodegenMainClass / -PcdsCodegenArgs or the
+// matching gradle.properties entries.
+// ---------------------------------------------------------------------------
+def codegenSettings = [
+        basePackage         : 'cds.gen',
+        strictSetters       : true,
+        interfacesForAspects: true,
+        linkedInterfaces    : true
+]
+
+def discoverCodegenEntryPoints = { java.util.Collection<File> jars ->
+    def results = [manifestMainClass: null, candidates: [] as List<String>]
+    def generatorJars = jars.findAll { it.name.startsWith('cds4j-codegen') || it.name.startsWith('cds-services-code-generator') }
+    def searchJars = generatorJars ?: jars
+
+    searchJars.each { jarFile ->
+        def zip = new java.util.zip.ZipFile(jarFile)
+        try {
+            def manifestEntry = zip.getEntry('META-INF/MANIFEST.MF')
+            if (manifestEntry != null && results.manifestMainClass == null) {
+                zip.getInputStream(manifestEntry).withStream { input ->
+                    def manifest = new java.util.jar.Manifest(input)
+                    def declared = manifest.mainAttributes.getValue('Main-Class')
+                    if (declared) {
+                        results.manifestMainClass = declared
+                    }
+                }
+            }
+        } finally {
+            zip.close()
+        }
+    }
+
+    if (results.manifestMainClass == null) {
+        def loader = new URLClassLoader(jars.collect { it.toURI().toURL() } as URL[],
+                (ClassLoader) ClassLoader.systemClassLoader.parent)
+        searchJars.each { jarFile ->
+            def zip = new java.util.zip.ZipFile(jarFile)
+            try {
+                zip.entries().each { entry ->
+                    if (!entry.name.endsWith('.class') || entry.name.contains('$')) {
+                        return
+                    }
+                    def className = entry.name[0..-7].replace('/', '.')
+                    try {
+                        def loaded = loader.loadClass(className)
+                        def main = loaded.declaredMethods.find {
+                            it.name == 'main' &&
+                            java.lang.reflect.Modifier.isStatic(it.modifiers) &&
+                            java.lang.reflect.Modifier.isPublic(it.modifiers) &&
+                            it.parameterCount == 1 &&
+                            it.parameterTypes[0] == String[].class
+                        }
+                        if (main != null) {
+                            results.candidates << className
+                        }
+                    } catch (Throwable ignored) {
+                        // classes whose dependencies are absent are simply not candidates
+                    }
+                }
+            } finally {
+                zip.close()
+            }
+        }
+        def preferred = results.candidates.findAll { name ->
+            ['generator', 'codegen', 'cli', 'main'].any { name.toLowerCase().contains(it) }
+        }
+        results.candidates = (preferred ?: results.candidates).unique().sort()
+    }
+    return results
+}
+
+tasks.register('cdsGenerate') {
+    group = 'cds'
+    description = 'Generates the cds.gen.* typed accessor interfaces (cds-maven-plugin goal: generate)'
+    dependsOn tasks.named('cdsBuild')
+    inputs.file csnFile
+    inputs.files configurations.named('cdsCodegen')
+    inputs.property 'settings', codegenSettings.toString()
+    inputs.property 'mainClassOverride', project.findProperty('cdsCodegenMainClass') ?: ''
+    inputs.property 'argsOverride', project.findProperty('cdsCodegenArgs') ?: ''
+    outputs.dir generatedSourcesDir
+
+    doLast {
+        def outputDir = generatedSourcesDir.get().asFile
+        delete outputDir
+        outputDir.mkdirs()
+
+        def classpathFiles = configurations.cdsCodegen.files
+        def discovered = discoverCodegenEntryPoints(classpathFiles)
+        def mainClassName = project.findProperty('cdsCodegenMainClass') ?:
+                discovered.manifestMainClass ?:
+                (discovered.candidates.size() == 1 ? discovered.candidates[0] : null)
+
+        if (mainClassName == null) {
+            throw new GradleException(
+                    "Could not determine the entry point of the CAP Java code generator.\n" +
+                    "  generator classpath : ${classpathFiles*.name}\n" +
+                    "  manifest Main-Class : ${discovered.manifestMainClass ?: '(none)'}\n" +
+                    "  main() candidates   : ${discovered.candidates ?: '(none)'}\n\n" +
+                    'Run `./gradlew :srv:cdsCodegenInspect` to print the jar contents and public API,\n' +
+                    'then pin it with cdsCodegenMainClass in gradle.properties.')
+        }
+
+        if (!project.hasProperty('cdsCodegenArgs')) {
+            def help = new ByteArrayOutputStream()
+            try {
+                javaexec {
+                    classpath = configurations.cdsCodegen
+                    mainClass = mainClassName
+                    args = ['--help']
+                    standardOutput = help
+                    errorOutput = help
+                    ignoreExitValue = true
+                }
+            } catch (Exception e) {
+                help.write(("could not run --help: " + e.message).bytes)
+            }
+            throw new GradleException(
+                    "The code generator entry point was found but its invocation is not pinned yet.\n" +
+                    "  main class : ${mainClassName}\n" +
+                    "  csn input  : ${csnFile}\n" +
+                    "  output dir : ${outputDir}\n" +
+                    "  settings to reproduce : ${codegenSettings}\n\n" +
+                    "--help output from the generator:\n${help.toString()}\n\n" +
+                    'Set cdsCodegenArgs in gradle.properties (or -PcdsCodegenArgs=...) using the option\n' +
+                    'names shown above. The placeholders {csn} and {out} are substituted with the paths\n' +
+                    'listed here. See MIGRATION.md -> "Closing the code-generation gap".')
+        }
+
+        def rawArgs = project.property('cdsCodegenArgs').toString()
+                .replace('{csn}', csnFile.absolutePath)
+                .replace('{out}', outputDir.absolutePath)
+                .replace('{basePackage}', codegenSettings.basePackage as String)
+        def argList = rawArgs.split('\\s+').findAll { it }
+
+        logger.lifecycle("cdsGenerate: ${mainClassName} ${argList.join(' ')}")
+        javaexec {
+            classpath = configurations.cdsCodegen
+            mainClass = mainClassName
+            args = argList
+        }
+
+        def generatedCount = fileTree(outputDir).matching { include '**/*.java' }.files.size()
+        if (generatedCount == 0) {
+            throw new GradleException("The code generator produced no .java files in ${outputDir}. " +
+                    'Check cdsCodegenArgs - the output directory option is probably wrong.')
+        }
+        logger.lifecycle("cdsGenerate produced ${generatedCount} Java source file(s)")
+    }
+}
+
+// Diagnostic helper. One run on a machine with Maven Central access prints
+// everything needed to pin the generator invocation above.
+tasks.register('cdsCodegenInspect') {
+    group = 'cds'
+    description = 'Prints the resolved CAP code generator jars, entry points and public API'
+    doLast {
+        def classpathFiles = configurations.cdsCodegen.files
+        println "=== resolved cdsCodegen classpath (${classpathFiles.size()} artifacts) ==="
+        classpathFiles.sort { it.name }.each { println "  ${it.name}" }
+
+        def discovered = discoverCodegenEntryPoints(classpathFiles)
+        println "\n=== manifest Main-Class ===\n  ${discovered.manifestMainClass ?: '(none)'}"
+        println "\n=== classes declaring public static void main(String[]) ==="
+        if (discovered.candidates) {
+            discovered.candidates.each { println "  ${it}" }
+        } else {
+            println '  (none - the generator exposes a programmatic API only)'
+        }
+
+        def generatorJar = classpathFiles.find { it.name.startsWith('cds4j-codegen') }
+        if (generatorJar) {
+            println "\n=== public types in ${generatorJar.name} ==="
+            def loader = new URLClassLoader(classpathFiles.collect { it.toURI().toURL() } as URL[],
+                    (ClassLoader) ClassLoader.systemClassLoader.parent)
+            def zip = new java.util.zip.ZipFile(generatorJar)
+            try {
+                zip.entries().collect { it.name }
+                        .findAll { it.endsWith('.class') && !it.contains('$') }
+                        .sort()
+                        .each { entryName ->
+                            def className = entryName[0..-7].replace('/', '.')
+                            try {
+                                def loaded = loader.loadClass(className)
+                                if (!java.lang.reflect.Modifier.isPublic(loaded.modifiers)) {
+                                    return
+                                }
+                                println "  ${loaded.name}"
+                                loaded.declaredMethods
+                                        .findAll { java.lang.reflect.Modifier.isPublic(it.modifiers) }
+                                        .sort { it.name }
+                                        .each { m ->
+                                            println "      ${m.returnType.simpleName} ${m.name}(${m.parameterTypes*.simpleName.join(', ')})"
+                                        }
+                                loaded.declaredConstructors
+                                        .findAll { java.lang.reflect.Modifier.isPublic(it.modifiers) }
+                                        .each { c ->
+                                            println "      <init>(${c.parameterTypes*.simpleName.join(', ')})"
+                                        }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+            } finally {
+                zip.close()
+            }
+        }
+
+        if (discovered.manifestMainClass || discovered.candidates) {
+            def entry = discovered.manifestMainClass ?: discovered.candidates[0]
+            println "\n=== ${entry} --help ==="
+            javaexec {
+                classpath = configurations.cdsCodegen
+                mainClass = entry
+                args = ['--help']
+                ignoreExitValue = true
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cds.clean  ->  cdsClean, wired into `clean`
+// Removes exactly the CDS build artefacts, all of which are already listed in
+// .gitignore (edmx/, schema-h2.sql, openapi.json, gen/).
+// ---------------------------------------------------------------------------
+tasks.register('cdsClean', Delete) {
+    group = 'cds'
+    description = 'Deletes CDS build output (cds-maven-plugin goal: clean)'
+    delete edmxDir, schemaH2File, openapiFile, rootProject.file('gen')
+}
+
+tasks.named('clean') { dependsOn tasks.named('cdsClean') }
+
+// ---------------------------------------------------------------------------
+// Wiring into the Java lifecycle.
+//   - cdsBuild writes into src/main/resources, so resources must wait for it
+//   - the generated sources are a source root, and compilation waits for them
+// ---------------------------------------------------------------------------
+sourceSets {
+    main {
+        java {
+            srcDir generatedSourcesDir
+        }
+    }
+}
+
+tasks.named('processResources') { dependsOn tasks.named('cdsBuild') }
+tasks.named('compileJava') { dependsOn tasks.named('cdsGenerate') }
+
+// ---------------------------------------------------------------------------
+// `./gradlew clean build` is a single invocation with two independent entry
+// points, and Gradle does not order independent tasks on its own. These
+// mustRunAfter edges guarantee the CDS steps re-run after the clean rather
+// than racing it. (mustRunAfter is ordering only, so it creates no cycle with
+// clean -> cdsClean.)
+// ---------------------------------------------------------------------------
+['npmCi', 'cdsResolve', 'cdsBuild', 'cdsGenerate'].each { taskName ->
+    tasks.named(taskName) {
+        mustRunAfter tasks.named('cdsClean')
+        mustRunAfter tasks.named('clean')
+        mustRunAfter rootProject.tasks.named('clean')
+    }
+}

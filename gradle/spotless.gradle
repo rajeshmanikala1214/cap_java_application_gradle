@@ -1,0 +1,47 @@
+// ===========================================================================
+// spotless-maven-plugin 3.6.0 equivalent.
+//
+// Maven configuration was:
+//   <java><googleJavaFormat><style>GOOGLE</style></googleJavaFormat></java>
+//   <pom><includes>pom.xml</includes><sortPom/></pom>
+//   bound to the process-sources phase with goal "check"
+//
+// The <pom>/sortPom half is dropped because there is no longer a pom.xml.
+// GOOGLE is google-java-format's default style, so it needs no explicit setting.
+//
+// This is applied through `apply from:` with its own buildscript block rather
+// than the plugins {} DSL, so that -PskipSpotless skips resolving the plugin
+// altogether. spotlessVersion is the one version in this build that could not
+// be derived from pom.xml - the Maven and Gradle Spotless plugins use separate
+// version lines. See MIGRATION.md.
+// ===========================================================================
+
+buildscript {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+    }
+    dependencies {
+        classpath "com.diffplug.spotless:spotless-plugin-gradle:${spotlessVersion}"
+    }
+}
+
+apply plugin: 'com.diffplug.spotless'
+
+spotless {
+    java {
+        // Scoped to hand-written sources only. Maven's default java target was
+        // ${basedir}/src/main/java and src/test/java, so the generated
+        // cds.gen.* sources were never format-checked; keeping that scope
+        // matters because generated code is not google-java-format clean.
+        target fileTree(projectDir) {
+            include 'src/main/java/**/*.java'
+            include 'src/test/java/**/*.java'
+        }
+        googleJavaFormat()
+    }
+}
+
+// Maven bound spotless:check to process-sources, i.e. before compilation.
+// The Gradle plugin wires spotlessCheck into `check` by default, which still
+// makes `gradle build` fail on a formatting violation, just later in the run.

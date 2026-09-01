@@ -1,0 +1,148 @@
+// ===========================================================================
+// :integration-tests  -  replaces integration-tests/pom.xml
+//                        (my:bookshop-integration-tests)
+//
+// Maven ran *IT.java through maven-failsafe-plugin (integration-test + verify)
+// and, in pre-integration-test, used cds-maven-plugin + exec-maven-plugin to
+// npm-install and asynchronously start the MTX sidecar. Reproduced here as an
+// `integrationTest` task with sidecar start/stop around it.
+// ===========================================================================
+
+plugins {
+    id 'java'
+    id 'jacoco'
+    id 'io.spring.dependency-management'
+}
+
+apply from: rootProject.file('gradle/java-conventions.gradle')
+
+// Maven: <sidecar.dir>../mtx/sidecar</sidecar.dir>
+def sidecarDir = rootProject.file('mtx/sidecar')
+
+def skipIntegrationTests = project.hasProperty('skipIntegrationTests') &&
+        project.property('skipIntegrationTests').toString().toBoolean()
+
+dependencies {
+    // Maven: my:bookshop test-scoped, excluding ch.qos.logback:logback-classic
+    testImplementation(project(':srv')) {
+        exclude group: 'ch.qos.logback', module: 'logback-classic'
+    }
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.security:spring-security-test'
+}
+
+// Failsafe's default includes.
+def integrationTestPatterns = ['**/IT*.class', '**/*IT.class', '**/*ITCase.class']
+
+// ---------------------------------------------------------------------------
+// Unit tests: this module overrode surefire with <failIfNoTests>false</failIfNoTests>
+// because it holds no *Test classes at all, only *IT ones. So the default
+// test task must not claim the *IT classes and must not fail when it finds
+// nothing - which is Gradle's default behaviour, hence no failOnNoDiscoveredTests
+// here (java-conventions sets it, so it is explicitly turned back off).
+// ---------------------------------------------------------------------------
+tasks.named('test') {
+    exclude integrationTestPatterns
+    if (it.hasProperty('failOnNoDiscoveredTests')) {
+        it.failOnNoDiscoveredTests = false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MTX sidecar lifecycle (cds-maven-plugin npm ci + exec-maven-plugin async run)
+// ---------------------------------------------------------------------------
+tasks.register('npmCiSidecar') {
+    group = 'cds'
+    description = 'Runs npm ci in mtx/sidecar (cds-maven-plugin execution: install-sidecar)'
+    dependsOn rootProject.tasks.named('installNode')
+    onlyIf { !skipIntegrationTests }
+    inputs.files new File(sidecarDir, 'package.json'), new File(sidecarDir, 'package-lock.json')
+    outputs.upToDateWhen { new File(sidecarDir, 'node_modules').isDirectory() }
+    doLast {
+        exec {
+            workingDir sidecarDir
+            commandLine rootProject.ext.npmCommand(['ci'])
+            environment rootProject.ext.nodeAwareEnvironment()
+        }
+    }
+}
+
+// The started process is held here so stopMtxSidecar can terminate it. This is
+// why org.gradle.parallel is off and the configuration cache is not enabled.
+ext.sidecarProcess = null
+
+tasks.register('startMtxSidecar') {
+    group = 'cds'
+    description = 'Starts the MTX sidecar in the background (exec-maven-plugin execution: start-sidecar, async=true)'
+    dependsOn tasks.named('npmCiSidecar')
+    onlyIf { !skipIntegrationTests }
+    doLast {
+        def logFile = layout.buildDirectory.file('mtx-sidecar.log').get().asFile
+        logFile.parentFile.mkdirs()
+        def builder = new ProcessBuilder(rootProject.ext.npmCommand(['run', 'start']))
+        builder.directory(sidecarDir)
+        builder.environment().clear()
+        builder.environment().putAll(rootProject.ext.nodeAwareEnvironment())
+        builder.redirectErrorStream(true)
+        builder.redirectOutput(logFile)
+        def process = builder.start()
+        project.ext.sidecarProcess = process
+        // Maven's async exec left the process to be reaped on JVM exit; keep a
+        // safety net so a failed build cannot leak the sidecar.
+        Runtime.runtime.addShutdownHook(new Thread({ if (process.isAlive()) process.destroy() }))
+        logger.lifecycle("MTX sidecar starting, output goes to ${logFile}")
+        // cds-serve needs a moment before the first request; the IT itself
+        // retries, so this is only a courtesy delay.
+        sleep(5000)
+        if (!process.isAlive()) {
+            throw new GradleException("MTX sidecar exited immediately. See ${logFile}")
+        }
+    }
+}
+
+tasks.register('stopMtxSidecar') {
+    group = 'cds'
+    description = 'Stops the MTX sidecar started by startMtxSidecar'
+    doLast {
+        def process = project.ext.sidecarProcess
+        if (process != null && process.isAlive()) {
+            process.destroy()
+            process.waitFor(20, java.util.concurrent.TimeUnit.SECONDS)
+            if (process.isAlive()) {
+                process.destroyForcibly()
+            }
+            logger.lifecycle('MTX sidecar stopped')
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// maven-failsafe-plugin equivalent
+// ---------------------------------------------------------------------------
+tasks.register('integrationTest', Test) {
+    group = 'verification'
+    description = 'Runs *IT integration tests against a running MTX sidecar (maven-failsafe-plugin equivalent)'
+    onlyIf { !skipIntegrationTests }
+
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    include integrationTestPatterns
+    useJUnitPlatform()
+    if (it.hasProperty('failOnNoDiscoveredTests')) {
+        it.failOnNoDiscoveredTests = false
+    }
+
+    dependsOn tasks.named('startMtxSidecar')
+    finalizedBy tasks.named('stopMtxSidecar')
+
+    testLogging {
+        events 'failed'
+        exceptionFormat = 'full'
+    }
+}
+
+// Maven bound failsafe's integration-test + verify goals, so `mvn verify` and
+// `mvn install` ran these. `gradle build` reaches them through `check`.
+tasks.named('check') {
+    dependsOn tasks.named('integrationTest')
+}

@@ -1,0 +1,109 @@
+// ===========================================================================
+// Node.js provisioning - replaces the cds-maven-plugin "install-node" goal.
+//
+// The Maven build downloaded a private Node.js into the project so that agents
+// did not need one preinstalled, and exposed it to later executions as
+// ${cds.node.directory} / ${cds.npm.executable}. This reproduces that: a local
+// Node is unpacked into <root>/node (already covered by .gitignore's "node/").
+//
+// Opt out with -PuseSystemNode=true to use the node/npm already on PATH, which
+// is the right choice on build agents that have no access to nodejs.org.
+// ===========================================================================
+
+def isWindows = System.getProperty('os.name').toLowerCase().contains('windows')
+ext.useSystemNode = project.hasProperty('useSystemNode') &&
+        project.property('useSystemNode').toString().toBoolean()
+
+def nodeHome = rootProject.layout.projectDirectory.dir('node').asFile
+ext.nodeHome = nodeHome
+
+// --- platform/arch mapping used to build the official distribution URL -------
+def rawArch = System.getProperty('os.arch').toLowerCase()
+def nodeArch = (rawArch in ['aarch64', 'arm64']) ? 'arm64' : (rawArch.contains('64') ? 'x64' : 'x86')
+def rawOs = System.getProperty('os.name').toLowerCase()
+def nodePlatform = isWindows ? 'win' : (rawOs.contains('mac') || rawOs.contains('darwin') ? 'darwin' : 'linux')
+def nodeArchiveName = isWindows ?
+        "node-v${nodeVersion}-win-${nodeArch}.zip" :
+        "node-v${nodeVersion}-${nodePlatform}-${nodeArch}.tar.gz"
+def nodeDownloadUrl = "${nodeDistBaseUrl}/v${nodeVersion}/${nodeArchiveName}"
+
+def localNodeBinary = isWindows ? new File(nodeHome, 'node.exe') : new File(nodeHome, 'bin/node')
+
+tasks.register('installNode') {
+    group = 'cds'
+    description = "Provisions Node.js ${nodeVersion} into ./node (cds-maven-plugin install-node equivalent)"
+    onlyIf { !useSystemNode }
+    outputs.file localNodeBinary
+    outputs.upToDateWhen { localNodeBinary.isFile() }
+
+    doLast {
+        def archive = new File(temporaryDir, nodeArchiveName)
+        logger.lifecycle("Downloading ${nodeDownloadUrl}")
+        archive.withOutputStream { out ->
+            new URL(nodeDownloadUrl).openStream().withStream { input -> out << input }
+        }
+
+        delete nodeHome
+        copy {
+            from(isWindows ? zipTree(archive) : tarTree(resources.gzip(archive)))
+            into nodeHome
+            includeEmptyDirs = false
+            // strip the "node-vX.Y.Z-platform-arch/" prefix the archive carries
+            eachFile { details ->
+                details.relativePath = new RelativePath(true, details.relativePath.segments.drop(1) as String[])
+            }
+        }
+        if (!isWindows) {
+            fileTree(new File(nodeHome, 'bin')).each { it.setExecutable(true) }
+        }
+        if (!localNodeBinary.isFile()) {
+            throw new GradleException("Node.js unpacked to ${nodeHome} but ${localNodeBinary} is missing. " +
+                    'Check nodeVersion/nodeDistBaseUrl in gradle.properties, or build with -PuseSystemNode=true.')
+        }
+        logger.lifecycle("Node.js ready at ${localNodeBinary}")
+    }
+}
+
+// --- command builders used by the CDS tasks ---------------------------------
+// npm is invoked through node + npm-cli.js rather than the npm/npm.cmd shell
+// wrapper, so the exact same code path works on Linux agents and Windows.
+ext.nodeBinary = { useSystemNode ? 'node' : localNodeBinary.absolutePath }
+
+ext.npmCommand = { List<String> args ->
+    if (useSystemNode) {
+        return [isWindows ? 'npm.cmd' : 'npm'] + args
+    }
+    def candidates = [
+            new File(nodeHome, 'lib/node_modules/npm/bin/npm-cli.js'),   // linux/darwin layout
+            new File(nodeHome, 'node_modules/npm/bin/npm-cli.js')        // windows layout
+    ]
+    def npmCli = candidates.find { it.isFile() }
+    if (npmCli == null) {
+        throw new GradleException("npm-cli.js not found under ${nodeHome}. Run ./gradlew installNode, " +
+                'or build with -PuseSystemNode=true.')
+    }
+    return [localNodeBinary.absolutePath, npmCli.absolutePath] + args
+}
+
+// @sap/cds-dk is a devDependency of the root package.json and is installed by
+// the npmCi task. bin/cds.js is its documented entry point.
+ext.cdsCommand = { List<String> args ->
+    def cdsScript = rootProject.file('node_modules/@sap/cds-dk/bin/cds.js')
+    if (!cdsScript.isFile()) {
+        throw new GradleException("${cdsScript} not found - run ./gradlew npmCi first " +
+                '(it installs the @sap/cds-dk version pinned in package.json).')
+    }
+    return [nodeBinary(), cdsScript.absolutePath] + args
+}
+
+// Environment for every node/npm/cds invocation, so nested tooling finds the
+// provisioned Node first. Mirrors the PATH override the Maven build applied.
+ext.nodeAwareEnvironment = {
+    def env = new LinkedHashMap<String, String>(System.getenv())
+    if (!useSystemNode) {
+        def binDir = isWindows ? nodeHome.absolutePath : new File(nodeHome, 'bin').absolutePath
+        def pathKey = env.keySet().find { it.equalsIgnoreCase('PATH') } ?: 'PATH'
+        env[pathKey] = binDir + File.pathSeparator + (env[pathKey] ?: '')
+    }
+    return env
+}

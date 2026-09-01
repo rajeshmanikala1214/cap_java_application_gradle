@@ -1,0 +1,25 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+    }
+    plugins {
+        // Replaces the <parent>spring-boot-starter-parent</parent> of the root pom
+        id 'org.springframework.boot'        version "${springBootVersion}"
+        id 'io.spring.dependency-management' version "${springDependencyManagementVersion}"
+    }
+}
+
+dependencyResolutionManagement {
+    repositories {
+        // Maven inherited Central from the super-POM; declared explicitly here.
+        mavenCentral()
+    }
+}
+
+// Maven: <artifactId>bookshop-parent</artifactId>
+rootProject.name = 'bookshop-parent'
+
+// Maven: <modules><module>srv</module><module>integration-tests</module></modules>
+include 'srv'
+include 'integration-tests'

@@ -1,0 +1,65 @@
+// ===========================================================================
+// Root build - replaces the aggregator pom.xml (my:bookshop-parent).
+//
+// group/version come from gradle.properties and are applied to every project,
+// which reproduces Maven's <groupId>my</groupId> + <version>${revision}</version>
+// inheritance. The flatten-maven-plugin that existed only to resolve the
+// CI-friendly ${revision} placeholder has no Gradle counterpart and is dropped.
+// ===========================================================================
+
+plugins {
+    id 'base'
+}
+
+// Node.js provisioning shared by :srv (cds build) and :integration-tests
+// (mtx sidecar). Replaces the cds-maven-plugin "install-node" goal, which was
+// declared in both srv/pom.xml and integration-tests/pom.xml.
+apply from: rootProject.file('gradle/node.gradle')
+
+// ---------------------------------------------------------------------------
+// maven-enforcer-plugin equivalent.
+//
+// Maven rules were: requireMavenVersion 3.6.3, requireJavaVersion ${jdk.version},
+// reactorModuleConvergence. requireMavenVersion is replaced by a Gradle version
+// floor, requireJavaVersion by the toolchain plus an explicit check, and
+// reactorModuleConvergence by a group/version convergence check.
+// ---------------------------------------------------------------------------
+def minimumGradleVersion = '8.13'   // Test.failOnNoDiscoveredTests was added in 8.13
+def targetJavaVersion = project.property('javaVersion').toString()
+
+tasks.register('verifyBuildEnvironment') {
+    group = 'verification'
+    description = 'Checks Gradle version, Java version and module convergence (maven-enforcer-plugin equivalent)'
+    doLast {
+        if (GradleVersion.current() < GradleVersion.version(minimumGradleVersion)) {
+            throw new GradleException(
+                "This build requires Gradle ${minimumGradleVersion} or later, but is running on ${GradleVersion.current().version}. " +
+                'Use the bundled wrapper (./gradlew) rather than a globally installed Gradle.')
+        }
+
+        def required = JavaVersion.toVersion(targetJavaVersion)
+        if (JavaVersion.current() < required) {
+            throw new GradleException(
+                "This build requires a JDK ${required} or later to launch Gradle, but is running on ${JavaVersion.current()}. " +
+                'Compilation itself is pinned to the Java toolchain configured in gradle/java-conventions.gradle.')
+        }
+
+        def divergent = subprojects.findAll { it.group != rootProject.group || it.version != rootProject.version }
+        if (divergent) {
+            throw new GradleException('Module convergence violated, these projects do not share the root group/version: ' +
+                divergent.collect { "${it.path} (${it.group}:${it.version})" }.join(', '))
+        }
+
+        logger.lifecycle("Build environment OK - Gradle ${GradleVersion.current().version}, " +
+            "launcher JDK ${JavaVersion.current()}, target Java ${targetJavaVersion}, " +
+            "${rootProject.group}:${rootProject.name}:${rootProject.version}")
+    }
+}
+
+// Maven bound the enforcer to the build lifecycle, so make it part of `check`
+// in every module that has one.
+subprojects {
+    plugins.withId('java') {
+        tasks.named('check') { dependsOn rootProject.tasks.named('verifyBuildEnvironment') }
+    }
+}
