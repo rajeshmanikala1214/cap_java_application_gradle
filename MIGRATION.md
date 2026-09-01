@@ -57,7 +57,7 @@ unchanged): `mta.yaml`, `mta-multi-tenant.yaml`, `sonar-project.properties`,
 | `jacoco-maven-plugin` 0.8.12 `prepare-agent` + XML `report` at verify | `jacoco` plugin, `toolVersion = '0.8.12'`, `test.finalizedBy jacocoTestReport`, XML only |
 | `flatten-maven-plugin` 1.7.3 | dropped. It existed only to resolve the CI-friendly `${revision}` placeholder, which Gradle does not need (`version` comes from `gradle.properties`) |
 | `maven-enforcer-plugin` 3.6.3 (requireMavenVersion, requireJavaVersion, reactorModuleConvergence) | `verifyBuildEnvironment` task: Gradle ≥ 8.13, launcher JDK ≥ 21, group/version convergence across modules; wired into `check` |
-| `spotless-maven-plugin` 3.6.0, google-java-format | `com.diffplug.spotless`, `googleJavaFormat()`, scoped to `src/main/java` + `src/test/java`. The `<pom><sortPom/></pom>` half is dropped with the POM |
+| `spotless-maven-plugin` 3.6.0, google-java-format | `com.diffplug.spotless` **8.6.0**, `googleJavaFormat()`, scoped to `src/main/java` + `src/test/java`. Spotless ships its Maven and Gradle plugins on separate version lines from the same release cycle, so maven 3.6.0 pairs with gradle 8.6.0 (verified against the upstream release tags). The `<pom><sortPom/></pom>` half is dropped with the POM |
 | `exec-maven-plugin` 3.6.3 (async MTX sidecar start) | `startMtxSidecar` / `stopMtxSidecar` tasks around `integrationTest` |
 | `native-maven-plugin` | **not carried over.** It was inherited configuration only, never bound to an execution, and `mvn verify` never invoked it. See "Deliberate omissions" |
 
@@ -134,45 +134,57 @@ Maven Plugin", and contains no mention of Gradle.
 The generator itself, however, is a **plain library artifact**:
 `com.sap.cds:cds4j-codegen` in CAP Java 4.x (renamed
 `com.sap.cds:cds-services-code-generator` in 5.0, per the CAP Java migration
-guide). So `cdsGenerate` resolves it into its own `cdsCodegen` configuration and
-invokes it directly — no Maven, no `mvn`, no POM.
+guide). It resolves from Maven Central like any other jar, and its API is:
 
-What is wired and what is not:
-
-* resolved: `com.sap.cds:cds4j-codegen:4.9.0` on a dedicated configuration
-* input: `srv/src/main/resources/edmx/csn.json` (verified to be where the CDS build puts it, 458,914 bytes for this model)
-* output: `srv/build/generated/sources/cds/main/java`, registered as a source root
-* incremental: task-level up-to-date on the CSN file, the generator classpath and the four settings
-* ordering: `cdsBuild` → `cdsGenerate` → `compileJava`
-* settings to reproduce: `basePackage=cds.gen`, `strictSetters=true`, `interfacesForAspects=true`, `linkedInterfaces=true`
-* **not wired: the entry point and its argument names.** These live inside the jar, which could not be downloaded where this migration was prepared.
-
-The task does not guess. It discovers the entry point from the artifact itself
-(manifest `Main-Class`, else a class declaring `public static void main(String[])`,
-preferring names containing generator/codegen/cli/main). If the invocation is not
-pinned it fails with the generator's own `--help` output in the message.
-
-### Closing it
-
-On any machine or agent with Maven Central access:
-
-```bash
-./gradlew :srv:cdsCodegenInspect
+```
+com.sap.cds.generator.Cds4jCodegen
+    <init>(Configuration)
+    Result generate(CsnSupplier, Consumer<GeneratedFile>)
+com.sap.cds.generator.ConfigurationImpl implements Configuration
+    setBasePackage(String), setStrictSetters(boolean),
+    setInterfacesForAspects(boolean), setLinkedInterfaces(boolean), ...
+com.sap.cds.generator.CsnSupplier          byte[] get()
+com.sap.cds.generator.util.FileSystem      <init>(Path, boolean) - the sink
 ```
 
-That prints the resolved artifacts, the manifest `Main-Class`, every `main()`
-candidate, the public API of `cds4j-codegen`, and the generator's `--help`. Then
-set the invocation in `gradle.properties`:
+There is no `main(String[])` anywhere on that classpath, so the goal is
+reproduced by `gradle/codegen-driver/src/main/java/capgradle/CdsCodegenDriver.java`:
+Gradle compiles it against the resolved `cdsCodegen` configuration
+(`compileCdsCodegenDriver`) and runs it with `javaexec`. The classpath is
+cds4j-codegen, cds4j-api, cds4j-core and their own dependencies - no Maven
+plugin API, no `mvn`.
 
-```properties
-cdsCodegenMainClass=<fully.qualified.Main>
-cdsCodegenArgs=--csn {csn} --out {out} --base-package {basePackage} …
+The driver sets exactly the four options the POM configured, logs the effective
+configuration (including a warning with the available constants if an enum option
+defaults to null), and prints the generator's status and issues. The meaning of
+the `FileSystem(Path, boolean)` flag is not publicly documented, so the driver
+tries one value and falls back to the other if nothing was written, reporting
+which attempt produced the files.
+
+## 5a. Spotless plugin resolution
+
+The first pipeline run failed at configuration time with:
+
+```
+Script 'gradle/spotless.gradle' line: 29
+> Plugin with id 'com.diffplug.spotless' not found.
 ```
 
-`{csn}`, `{out}` and `{basePackage}` are substituted with the paths above. If the
-inspection shows the generator exposes only a programmatic API with no `main`, the
-same output gives the constructor and method signatures needed for a small
-`buildSrc` driver, which is still Maven-free.
+Cause: `gradle/spotless.gradle` is applied with `apply from:` and carried its own
+`buildscript { }` block. That block adds the jar to **that script's** classloader,
+but `apply plugin: '<id>'` resolves plugin ids against the **target project's**
+plugin classpath, which never saw the addition. The block was there so that
+`-PskipSpotless` could avoid resolving the plugin at all; the trade was not worth
+it, because it broke the default path.
+
+Fix, using Gradle's normal plugin management:
+
+1. `settings.gradle` declares the id and version in `pluginManagement.plugins`.
+2. The root `build.gradle` declares `id 'com.diffplug.spotless' apply false`, which puts it on the root buildscript classpath that all subprojects inherit.
+3. `gradle/spotless.gradle` drops the `buildscript` block and keeps `apply plugin: 'com.diffplug.spotless'`, which now resolves.
+
+`-PskipSpotless` still skips *applying* Spotless, but no longer avoids resolving
+the plugin marker.
 
 ## 6. Verification status
 
@@ -197,6 +209,11 @@ Run on Gradle 8.14.3 with a real JDK 21 (SapMachine 21.0.7).
 | `cdsGenerate` diagnostic path | with the invocation unpinned it fails with the generator's own `--help` output embedded in the message |
 | Generated sources are a compile root | `main.java.srcDirs` contains `srv/build/generated/sources/cds/main/java`, and `compileJava`'s source set includes the generated file |
 | `clean` / `cdsClean` | removes `edmx/`, `schema-h2.sql`, `openapi.json` and the generated sources, while leaving tracked resources (`application.yaml`, `swagger/index.html`) intact |
+| Spotless plugin resolution | verified with stub plugin markers published to a local Maven repo, so the real `settings.gradle`, root `plugins {}` block and `gradle/spotless.gradle` are exercised unmodified. `spotless { java { target(...); googleJavaFormat() } }` configures for both Java modules and `:srv:spotlessCheck` appears in the `clean build` graph |
+| Spotless / dependency-management versions | cross-checked against upstream release tags: `diffplug/spotless` publishes `maven/3.6.0` alongside `gradle/8.6.0`, and `dependency-management-plugin` has `v1.1.7` |
+| MBT invocation form | `-p .. clean :srv:bootJar` run from inside `srv/` executed clean → cdsClean → installNode → npmCi → cdsResolve → cdsBuild → cdsGenerate → compileJava in order |
+| Node auto-detection | `installNode` skipped with "Using Node.js from PATH (v22.22.2)" |
+| `cdsGenerate` diagnostic output | the unpinned-invocation failure prints the resolved classpath, manifest `Main-Class`, `main()` candidates, the generator's full public API and its `--help` output |
 
 So the CDS half of the build — Node bootstrap, npm install, model resolution from
 jars, the three CDS commands, code-generation plumbing, incremental behaviour and
@@ -210,16 +227,17 @@ The environment where this migration was prepared blocks `repo1.maven.org`,
 `nodejs.org` (HTTP 403, `x-deny-reason: host_not_allowed`). Consequences:
 
 1. **`./gradlew clean build` has not been executed end to end.** No Spring Boot, CAP SDK, JaCoCo or Spotless artefact could be resolved, so no Java source was compiled and no test was run. Treat the first pipeline run as the real acceptance test.
-2. **The real `cds4j-codegen` entry point and its argument names are unknown**, so `cdsGenerate` will fail with an actionable message until `cdsCodegenArgs` is pinned. The harness around it is verified (see the table above); only the two property values are missing. Section 5 has the one command that produces them.
+2. **The driver has not run against the real cds4j-codegen.** Its API surface was taken from a live `cdsCodegenInspect`-style dump produced by an actual pipeline run, and the driver was compiled and executed against a stand-in exposing those exact signatures. What remains unverified is the runtime semantics: whether `ConfigurationImpl`'s enum defaults are all non-null, and which value of the `FileSystem` flag writes files (the driver handles either).
 3. **The real CAP jars' internal model path is unconfirmed.** The resolution mechanism and both candidate prefixes are verified against a fixture; if the real jars differ, `cdsResolve` fails and prints the actual layout, and `-PcdsModelJarPrefix` fixes it without a code change.
 4. **`installNode` download path not executed** (nodejs.org blocked). All Gradle-side execution used `-PuseSystemNode=true`.
-5. **Two plugin versions could not be checked against a repository**, because they have no counterpart in the POM: `io.spring.dependency-management` 1.1.7 and `com.diffplug.spotless` 7.0.4. If either fails to resolve, bump it in `gradle.properties`. Spotless can be bypassed with `-PskipSpotless`, which also skips resolving it.
+5. **Plugin resolution from the Gradle Plugin Portal has not been exercised.** `com.diffplug.spotless` 8.6.0 and `io.spring.dependency-management` 1.1.7 both exist as upstream release tags, and the resolution *mechanism* is verified against a local repo, but the portal itself is unreachable from here.
 6. **Spotless has not been run**, so it is unknown whether the existing sources satisfy the Gradle plugin's google-java-format version. If `spotlessCheck` fails purely on formatting, run `./gradlew spotlessApply` or build with `-PskipSpotless`.
 7. **`integrationTest` has not been executed.** The MTX sidecar start/stop wiring is verified only as a task graph. `-PskipIntegrationTests=true` skips it.
 
 ## 7. Deliberate omissions and differences
 
 * **`native-maven-plugin`** is not carried over. It was inherited, unbound configuration (`metadataRepository` 0.3.14 in `srv`, `skipNativeTests` in `integration-tests`) that only activated under a `native` profile; `mvn verify` never ran it. To restore native image support, add `org.graalvm.buildtools.native` to `:srv`. It was left out to avoid making the primary build depend on a plugin version that could not be verified here.
+* **Node provisioning.** The Maven goal downloaded Node unconditionally. `installNode` now uses the Node already on `PATH` when its major version satisfies `nodeMinimumMajor` (20, from `@sap/cds` `engines.node`), and downloads only otherwise. This matters on agents like `devxci/mbtci-java21-node20`, which ship Node 20 but may not reach nodejs.org. Force either path with `-PuseSystemNode=true|false`.
 * **CI JDK.** The old workflow ran on JDK 25 while `pom.xml` set `jdk.version=21`. The new workflow uses JDK 21, matching the toolchain. Compilation output is unchanged either way (`--release 21`).
 * **JaCoCo report path** moves from `srv/target/site/jacoco/jacoco.xml` to `srv/build/reports/jacoco/test/jacocoTestReport.xml`. `sonar-project.properties` is updated accordingly.
 * **Spotless ordering.** Maven bound `spotless:check` to `process-sources`, i.e. before compilation. Gradle's plugin attaches it to `check`, so a formatting violation fails later in the same build rather than earlier.
@@ -232,7 +250,7 @@ The environment where this migration was prepared blocks `repo1.maven.org`,
 * Network access to `repo1.maven.org` (or your mirror) and `plugins.gradle.org`.
 * Network access to `services.gradle.org` for the wrapper's first run, unless you seed `GRADLE_USER_HOME/wrapper/dists` or point `distributionUrl` at an internal mirror.
 * `npm` reachable at `registry.npmjs.org` for `npm ci`.
-* Node.js: either allow `nodejs.org` so `installNode` can provision Node 22, or install Node 22 on the agent and build with `-PuseSystemNode=true`.
+* Node.js 20 or newer on the agent `PATH` (the `devxci/mbtci-java21-node20` image satisfies this and `installNode` will skip). Only if no suitable Node is present does the build need `nodejs.org`.
 * No Maven, no `mvn`, no `pom.xml` required.
 
 ## 9. Commands
