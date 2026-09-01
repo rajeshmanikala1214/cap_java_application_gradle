@@ -28,12 +28,19 @@ def generatedSourcesDir = layout.buildDirectory.dir('generated/sources/cds/main/
 
 // Every .cds file that can influence the compiled model, plus the imported
 // EDMX and the CDS configuration.
+// Rooted at the individual model folders rather than the repository root, and
+// with build output excluded. A tree rooted at the repository root overlaps the
+// output directories of other tasks (for example the codegen driver's classes),
+// which Gradle rejects as an undeclared implicit dependency.
 def cdsModelInputs = files(
-        fileTree(cdsRoot) {
-            include 'db/**/*.cds', 'srv/**/*.cds', 'app/**/*.cds', 'fts/**/*.cds'
-            include 'srv/external/*.edmx'
-            exclude '**/node_modules/**'
+        fileTree(rootProject.file('db')) { include '**/*.cds' },
+        fileTree(rootProject.file('srv')) {
+            include '**/*.cds'
+            include 'external/*.edmx'
+            exclude 'build/**', 'target/**', 'src/main/resources/edmx/**'
         },
+        fileTree(rootProject.file('app')) { include '**/*.cds'; exclude '**/node_modules/**' },
+        fileTree(rootProject.file('fts')) { include '**/*.cds' },
         rootProject.file('package.json'),
         rootProject.file('.cdsrc.json')
 )
@@ -408,15 +415,37 @@ def codegenHelpOutput = { String mainClassName ->
     return captured.toString()
 }
 
+// ---------------------------------------------------------------------------
+// The generator driver.
+//
+// cds4j-codegen 4.9.0 ships no main(String[]) - it is a library. Its entry point
+// is new Cds4jCodegen(Configuration).generate(CsnSupplier, Consumer<GeneratedFile>),
+// so a tiny Java driver is compiled against the resolved cdsCodegen classpath and
+// executed. Nothing Maven-related is on that classpath: it is cds4j-codegen,
+// cds4j-api, cds4j-core and their own dependencies.
+// ---------------------------------------------------------------------------
+def codegenDriverSource = rootProject.file('gradle/codegen-driver/src/main/java')
+def codegenDriverClasses = layout.buildDirectory.dir('codegen-driver/classes')
+
+tasks.register('compileCdsCodegenDriver', JavaCompile) {
+    group = 'cds'
+    description = 'Compiles the cds4j-codegen driver used by cdsGenerate'
+    source = fileTree(codegenDriverSource)
+    classpath = configurations.cdsCodegen
+    destinationDirectory = codegenDriverClasses
+    options.encoding = 'UTF-8'
+    options.release = Integer.parseInt(project.property('javaVersion').toString())
+}
+
 tasks.register('cdsGenerate') {
     group = 'cds'
     description = 'Generates the cds.gen.* typed accessor interfaces (cds-maven-plugin goal: generate)'
     dependsOn tasks.named('cdsBuild')
+    dependsOn tasks.named('compileCdsCodegenDriver')
     inputs.file csnFile
     inputs.files configurations.named('cdsCodegen')
+    inputs.dir codegenDriverSource
     inputs.property 'settings', codegenSettings.toString()
-    inputs.property 'mainClassOverride', project.findProperty('cdsCodegenMainClass') ?: ''
-    inputs.property 'argsOverride', project.findProperty('cdsCodegenArgs') ?: ''
     outputs.dir generatedSourcesDir
 
     doLast {
@@ -424,54 +453,30 @@ tasks.register('cdsGenerate') {
         delete outputDir
         outputDir.mkdirs()
 
-        def classpathFiles = configurations.cdsCodegen.files
-        def discovered = discoverCodegenEntryPoints(classpathFiles)
-        def mainClassName = project.findProperty('cdsCodegenMainClass') ?:
-                discovered.manifestMainClass ?:
-                (discovered.candidates.size() == 1 ? discovered.candidates[0] : null)
-
-        if (mainClassName == null) {
-            throw new GradleException(
-                    "Could not determine the entry point of the CAP Java code generator.\n\n" +
-                    describeCodegenArtifacts(classpathFiles, discovered) + "\n" +
-                    'Pin it with cdsCodegenMainClass + cdsCodegenArgs in gradle.properties. If the listing\n' +
-                    'above shows no main() at all, the generator exposes a programmatic API only and the\n' +
-                    'signatures above are what a small buildSrc driver needs. See MIGRATION.md section 5.')
+        if (!csnFile.isFile()) {
+            throw new GradleException("${csnFile} is missing - cdsBuild did not produce the CSN model.")
         }
 
-        if (!project.hasProperty('cdsCodegenArgs')) {
-            throw new GradleException(
-                    "The code generator entry point was found but its invocation is not pinned yet.\n\n" +
-                    "  main class : ${mainClassName}\n" +
-                    "  csn input  : ${csnFile}\n" +
-                    "  output dir : ${outputDir}\n" +
-                    "  settings to reproduce : ${codegenSettings}\n\n" +
-                    describeCodegenArtifacts(classpathFiles, discovered) + "\n" +
-                    "--help output from ${mainClassName}:\n${codegenHelpOutput(mainClassName)}\n" +
-                    'Set cdsCodegenArgs in gradle.properties (or -PcdsCodegenArgs=...) using the option\n' +
-                    'names shown above. {csn}, {out} and {basePackage} are substituted with the values\n' +
-                    'listed here. See MIGRATION.md -> "Closing the code-generation gap".')
-        }
-
-        def argList = project.property('cdsCodegenArgs').toString()
-                .replace('{csn}', csnFile.absolutePath)
-                .replace('{out}', outputDir.absolutePath)
-                .replace('{basePackage}', codegenSettings.basePackage as String)
-                .split('\\s+').findAll { it }
-
-        logger.lifecycle("cdsGenerate: ${mainClassName} ${argList.join(' ')}")
         javaexec {
-            classpath = configurations.cdsCodegen
-            mainClass = mainClassName
-            args = argList
+            classpath = files(codegenDriverClasses) + configurations.cdsCodegen
+            mainClass = 'capgradle.CdsCodegenDriver'
+            args = [
+                    csnFile.absolutePath,
+                    outputDir.absolutePath,
+                    codegenSettings.basePackage as String,
+                    codegenSettings.strictSetters as String,
+                    codegenSettings.interfacesForAspects as String,
+                    codegenSettings.linkedInterfaces as String
+            ]
         }
 
         def generatedCount = fileTree(outputDir).matching { include '**/*.java' }.files.size()
         if (generatedCount == 0) {
-            throw new GradleException("The code generator produced no .java files in ${outputDir}. " +
-                    'Check cdsCodegenArgs - the output directory option is probably wrong.')
+            throw new GradleException("The code generator produced no .java files in ${outputDir}.\n\n" +
+                    describeCodegenArtifacts(configurations.cdsCodegen.files,
+                            discoverCodegenEntryPoints(configurations.cdsCodegen.files)))
         }
-        logger.lifecycle("cdsGenerate produced ${generatedCount} Java source file(s)")
+        logger.lifecycle("cdsGenerate produced ${generatedCount} Java source file(s) in ${codegenSettings.basePackage}")
     }
 }
 
@@ -484,11 +489,12 @@ tasks.register('cdsCodegenInspect') {
         def classpathFiles = configurations.cdsCodegen.files
         def discovered = discoverCodegenEntryPoints(classpathFiles)
         println describeCodegenArtifacts(classpathFiles, discovered)
-        def entry = project.findProperty('cdsCodegenMainClass') ?:
-                discovered.manifestMainClass ?: discovered.candidates.find { true }
+        def entry = discovered.manifestMainClass ?: discovered.candidates.find { true }
         if (entry) {
             println "--help output from ${entry}:"
             println codegenHelpOutput(entry as String)
+        } else {
+            println 'No main(String[]) - the generator is a library. gradle/codegen-driver drives it.'
         }
     }
 }
