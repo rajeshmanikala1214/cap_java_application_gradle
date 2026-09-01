@@ -270,12 +270,32 @@ tasks.register('cdsBuild') {
 // invocation can be pinned with -PcdsCodegenMainClass / -PcdsCodegenArgs or the
 // matching gradle.properties entries.
 // ---------------------------------------------------------------------------
+// The options the original srv/pom.xml set on the cds:generate goal, plus the
+// two the Maven goal defaulted to true. ConfigurationImpl's own defaults are
+// plain Java defaults, so cqnServices and eventContext arrive as false, which
+// generates the entity interfaces but neither the typed service interfaces
+// (AdminService, ReviewService, ApiBusinessPartner) nor the *Context event
+// contexts - 30 "cannot find symbol" errors in compileJava.
+//
+// Add or override any other cds4j-codegen option without touching the driver:
+//   ./gradlew build -PcdsCodegenOptions=cqnServiceGetters=true,betterNames=true
 def codegenSettings = [
-        basePackage         : 'cds.gen',
-        strictSetters       : true,
-        interfacesForAspects: true,
-        linkedInterfaces    : true
+        basePackage         : 'cds.gen',   // pom: <basePackage>
+        strictSetters       : true,        // pom: <strictSetters>
+        interfacesForAspects: true,        // pom: <interfacesForAspects>
+        linkedInterfaces    : true,        // pom: <linkedInterfaces>
+        cqnServices         : true,        // cds-maven-plugin default
+        eventContext        : true         // cds-maven-plugin default
 ]
+
+if (project.hasProperty('cdsCodegenOptions')) {
+    project.property('cdsCodegenOptions').toString().split(',').each { entry ->
+        def parts = entry.split('=', 2)
+        if (parts.length == 2 && parts[0].trim()) {
+            codegenSettings[parts[0].trim()] = parts[1].trim()
+        }
+    }
+}
 
 def discoverCodegenEntryPoints = { java.util.Collection<File> jars ->
     def results = [manifestMainClass: null, candidates: [] as List<String>]
@@ -457,17 +477,13 @@ tasks.register('cdsGenerate') {
             throw new GradleException("${csnFile} is missing - cdsBuild did not produce the CSN model.")
         }
 
+        def driverArgs = ["csn=${csnFile.absolutePath}", "out=${outputDir.absolutePath}"]
+        codegenSettings.each { name, value -> driverArgs << "set.${name}=${value}" }
+
         javaexec {
             classpath = files(codegenDriverClasses) + configurations.cdsCodegen
             mainClass = 'capgradle.CdsCodegenDriver'
-            args = [
-                    csnFile.absolutePath,
-                    outputDir.absolutePath,
-                    codegenSettings.basePackage as String,
-                    codegenSettings.strictSetters as String,
-                    codegenSettings.interfacesForAspects as String,
-                    codegenSettings.linkedInterfaces as String
-            ]
+            args = driverArgs
         }
 
         def generatedCount = fileTree(outputDir).matching { include '**/*.java' }.files.size()
