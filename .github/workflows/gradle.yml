@@ -32,7 +32,7 @@ jobs:
         java-version: 21
         distribution: 'sapmachine'
     - name: Set up Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v7
       with:
         node-version: 22
     - name: Build with Gradle
