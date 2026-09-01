@@ -9,6 +9,10 @@
 
 plugins {
     id 'base'
+    // Resolved here (not applied) so the plugin lands on the root buildscript
+    // classpath, which every subproject inherits. gradle/spotless.gradle can
+    // then apply it by id. Version comes from pluginManagement in settings.gradle.
+    id 'com.diffplug.spotless' apply false
 }
 
 // Node.js provisioning shared by :srv (cds build) and :integration-tests

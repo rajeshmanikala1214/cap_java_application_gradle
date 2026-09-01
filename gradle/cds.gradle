@@ -272,7 +272,9 @@ def codegenSettings = [
 
 def discoverCodegenEntryPoints = { java.util.Collection<File> jars ->
     def results = [manifestMainClass: null, candidates: [] as List<String>]
-    def generatorJars = jars.findAll { it.name.startsWith('cds4j-codegen') || it.name.startsWith('cds-services-code-generator') }
+    def generatorJars = jars.findAll {
+        it.name.startsWith('cds4j-codegen') || it.name.startsWith('cds-services-code-generator')
+    }
     def searchJars = generatorJars ?: jars
 
     searchJars.each { jarFile ->
@@ -281,8 +283,7 @@ def discoverCodegenEntryPoints = { java.util.Collection<File> jars ->
             def manifestEntry = zip.getEntry('META-INF/MANIFEST.MF')
             if (manifestEntry != null && results.manifestMainClass == null) {
                 zip.getInputStream(manifestEntry).withStream { input ->
-                    def manifest = new java.util.jar.Manifest(input)
-                    def declared = manifest.mainAttributes.getValue('Main-Class')
+                    def declared = new java.util.jar.Manifest(input).mainAttributes.getValue('Main-Class')
                     if (declared) {
                         results.manifestMainClass = declared
                     }
@@ -303,21 +304,18 @@ def discoverCodegenEntryPoints = { java.util.Collection<File> jars ->
                     if (!entry.name.endsWith('.class') || entry.name.contains('$')) {
                         return
                     }
-                    def className = entry.name[0..-7].replace('/', '.')
                     try {
-                        def loaded = loader.loadClass(className)
-                        def main = loaded.declaredMethods.find {
+                        def loaded = loader.loadClass(entry.name[0..-7].replace('/', '.'))
+                        if (loaded.declaredMethods.any {
                             it.name == 'main' &&
                             java.lang.reflect.Modifier.isStatic(it.modifiers) &&
                             java.lang.reflect.Modifier.isPublic(it.modifiers) &&
-                            it.parameterCount == 1 &&
-                            it.parameterTypes[0] == String[].class
-                        }
-                        if (main != null) {
-                            results.candidates << className
+                            it.parameterCount == 1 && it.parameterTypes[0] == String[].class
+                        }) {
+                            results.candidates << loaded.name
                         }
                     } catch (Throwable ignored) {
-                        // classes whose dependencies are absent are simply not candidates
+                        // classes whose own dependencies are absent are not candidates
                     }
                 }
             } finally {
@@ -330,6 +328,84 @@ def discoverCodegenEntryPoints = { java.util.Collection<File> jars ->
         results.candidates = (preferred ?: results.candidates).unique().sort()
     }
     return results
+}
+
+// A full description of the generator artifacts. Emitted by cdsCodegenInspect and
+// embedded in every cdsGenerate failure, so that a single CI run captures
+// everything needed to pin the invocation - including the case where the
+// generator has no main() and a programmatic API has to be driven instead.
+def describeCodegenArtifacts = { java.util.Collection<File> jars, Map discovered ->
+    def report = new StringBuilder()
+    report << "resolved cdsCodegen classpath (${jars.size()} artifacts):\n"
+    jars.sort { it.name }.each { report << "      ${it.name}\n" }
+    report << "manifest Main-Class: ${discovered.manifestMainClass ?: '(none)'}\n"
+    report << "classes declaring public static void main(String[]): " +
+            "${discovered.candidates ? discovered.candidates.join(', ') : '(none)'}\n"
+
+    def generatorJar = jars.find {
+        it.name.startsWith('cds4j-codegen') || it.name.startsWith('cds-services-code-generator')
+    }
+    if (generatorJar == null) {
+        return report.toString()
+    }
+
+    report << "public API of ${generatorJar.name}:\n"
+    def loader = new URLClassLoader(jars.collect { it.toURI().toURL() } as URL[],
+            (ClassLoader) ClassLoader.systemClassLoader.parent)
+    def zip = new java.util.zip.ZipFile(generatorJar)
+    def shown = 0
+    try {
+        zip.entries().collect { it.name }
+                .findAll { it.endsWith('.class') && !it.contains('$') }
+                .sort()
+                .each { entryName ->
+                    if (shown >= 150) {
+                        return
+                    }
+                    try {
+                        def loaded = loader.loadClass(entryName[0..-7].replace('/', '.'))
+                        if (!java.lang.reflect.Modifier.isPublic(loaded.modifiers)) {
+                            return
+                        }
+                        shown++
+                        report << "      ${loaded.name}\n"
+                        loaded.declaredConstructors
+                                .findAll { java.lang.reflect.Modifier.isPublic(it.modifiers) }
+                                .each { report << "          <init>(${it.parameterTypes*.simpleName.join(', ')})\n" }
+                        loaded.declaredMethods
+                                .findAll { java.lang.reflect.Modifier.isPublic(it.modifiers) }
+                                .sort { it.name }
+                                .each {
+                                    report << "          ${it.returnType.simpleName} ${it.name}" +
+                                            "(${it.parameterTypes*.simpleName.join(', ')})\n"
+                                }
+                    } catch (Throwable ignored) {
+                    }
+                }
+    } finally {
+        zip.close()
+    }
+    if (shown >= 150) {
+        report << "      … truncated at 150 public types\n"
+    }
+    return report.toString()
+}
+
+def codegenHelpOutput = { String mainClassName ->
+    def captured = new ByteArrayOutputStream()
+    try {
+        javaexec {
+            classpath = configurations.cdsCodegen
+            mainClass = mainClassName
+            args = ['--help']
+            standardOutput = captured
+            errorOutput = captured
+            ignoreExitValue = true
+        }
+    } catch (Exception e) {
+        captured.write(("could not run --help: ${e.message}").bytes)
+    }
+    return captured.toString()
 }
 
 tasks.register('cdsGenerate') {
@@ -356,45 +432,32 @@ tasks.register('cdsGenerate') {
 
         if (mainClassName == null) {
             throw new GradleException(
-                    "Could not determine the entry point of the CAP Java code generator.\n" +
-                    "  generator classpath : ${classpathFiles*.name}\n" +
-                    "  manifest Main-Class : ${discovered.manifestMainClass ?: '(none)'}\n" +
-                    "  main() candidates   : ${discovered.candidates ?: '(none)'}\n\n" +
-                    'Run `./gradlew :srv:cdsCodegenInspect` to print the jar contents and public API,\n' +
-                    'then pin it with cdsCodegenMainClass in gradle.properties.')
+                    "Could not determine the entry point of the CAP Java code generator.\n\n" +
+                    describeCodegenArtifacts(classpathFiles, discovered) + "\n" +
+                    'Pin it with cdsCodegenMainClass + cdsCodegenArgs in gradle.properties. If the listing\n' +
+                    'above shows no main() at all, the generator exposes a programmatic API only and the\n' +
+                    'signatures above are what a small buildSrc driver needs. See MIGRATION.md section 5.')
         }
 
         if (!project.hasProperty('cdsCodegenArgs')) {
-            def help = new ByteArrayOutputStream()
-            try {
-                javaexec {
-                    classpath = configurations.cdsCodegen
-                    mainClass = mainClassName
-                    args = ['--help']
-                    standardOutput = help
-                    errorOutput = help
-                    ignoreExitValue = true
-                }
-            } catch (Exception e) {
-                help.write(("could not run --help: " + e.message).bytes)
-            }
             throw new GradleException(
-                    "The code generator entry point was found but its invocation is not pinned yet.\n" +
+                    "The code generator entry point was found but its invocation is not pinned yet.\n\n" +
                     "  main class : ${mainClassName}\n" +
                     "  csn input  : ${csnFile}\n" +
                     "  output dir : ${outputDir}\n" +
                     "  settings to reproduce : ${codegenSettings}\n\n" +
-                    "--help output from the generator:\n${help.toString()}\n\n" +
+                    describeCodegenArtifacts(classpathFiles, discovered) + "\n" +
+                    "--help output from ${mainClassName}:\n${codegenHelpOutput(mainClassName)}\n" +
                     'Set cdsCodegenArgs in gradle.properties (or -PcdsCodegenArgs=...) using the option\n' +
-                    'names shown above. The placeholders {csn} and {out} are substituted with the paths\n' +
+                    'names shown above. {csn}, {out} and {basePackage} are substituted with the values\n' +
                     'listed here. See MIGRATION.md -> "Closing the code-generation gap".')
         }
 
-        def rawArgs = project.property('cdsCodegenArgs').toString()
+        def argList = project.property('cdsCodegenArgs').toString()
                 .replace('{csn}', csnFile.absolutePath)
                 .replace('{out}', outputDir.absolutePath)
                 .replace('{basePackage}', codegenSettings.basePackage as String)
-        def argList = rawArgs.split('\\s+').findAll { it }
+                .split('\\s+').findAll { it }
 
         logger.lifecycle("cdsGenerate: ${mainClassName} ${argList.join(' ')}")
         javaexec {
@@ -419,64 +482,13 @@ tasks.register('cdsCodegenInspect') {
     description = 'Prints the resolved CAP code generator jars, entry points and public API'
     doLast {
         def classpathFiles = configurations.cdsCodegen.files
-        println "=== resolved cdsCodegen classpath (${classpathFiles.size()} artifacts) ==="
-        classpathFiles.sort { it.name }.each { println "  ${it.name}" }
-
         def discovered = discoverCodegenEntryPoints(classpathFiles)
-        println "\n=== manifest Main-Class ===\n  ${discovered.manifestMainClass ?: '(none)'}"
-        println "\n=== classes declaring public static void main(String[]) ==="
-        if (discovered.candidates) {
-            discovered.candidates.each { println "  ${it}" }
-        } else {
-            println '  (none - the generator exposes a programmatic API only)'
-        }
-
-        def generatorJar = classpathFiles.find { it.name.startsWith('cds4j-codegen') }
-        if (generatorJar) {
-            println "\n=== public types in ${generatorJar.name} ==="
-            def loader = new URLClassLoader(classpathFiles.collect { it.toURI().toURL() } as URL[],
-                    (ClassLoader) ClassLoader.systemClassLoader.parent)
-            def zip = new java.util.zip.ZipFile(generatorJar)
-            try {
-                zip.entries().collect { it.name }
-                        .findAll { it.endsWith('.class') && !it.contains('$') }
-                        .sort()
-                        .each { entryName ->
-                            def className = entryName[0..-7].replace('/', '.')
-                            try {
-                                def loaded = loader.loadClass(className)
-                                if (!java.lang.reflect.Modifier.isPublic(loaded.modifiers)) {
-                                    return
-                                }
-                                println "  ${loaded.name}"
-                                loaded.declaredMethods
-                                        .findAll { java.lang.reflect.Modifier.isPublic(it.modifiers) }
-                                        .sort { it.name }
-                                        .each { m ->
-                                            println "      ${m.returnType.simpleName} ${m.name}(${m.parameterTypes*.simpleName.join(', ')})"
-                                        }
-                                loaded.declaredConstructors
-                                        .findAll { java.lang.reflect.Modifier.isPublic(it.modifiers) }
-                                        .each { c ->
-                                            println "      <init>(${c.parameterTypes*.simpleName.join(', ')})"
-                                        }
-                            } catch (Throwable ignored) {
-                            }
-                        }
-            } finally {
-                zip.close()
-            }
-        }
-
-        if (discovered.manifestMainClass || discovered.candidates) {
-            def entry = discovered.manifestMainClass ?: discovered.candidates[0]
-            println "\n=== ${entry} --help ==="
-            javaexec {
-                classpath = configurations.cdsCodegen
-                mainClass = entry
-                args = ['--help']
-                ignoreExitValue = true
-            }
+        println describeCodegenArtifacts(classpathFiles, discovered)
+        def entry = project.findProperty('cdsCodegenMainClass') ?:
+                discovered.manifestMainClass ?: discovered.candidates.find { true }
+        if (entry) {
+            println "--help output from ${entry}:"
+            println codegenHelpOutput(entry as String)
         }
     }
 }

@@ -9,22 +9,14 @@
 // The <pom>/sortPom half is dropped because there is no longer a pom.xml.
 // GOOGLE is google-java-format's default style, so it needs no explicit setting.
 //
-// This is applied through `apply from:` with its own buildscript block rather
-// than the plugins {} DSL, so that -PskipSpotless skips resolving the plugin
-// altogether. spotlessVersion is the one version in this build that could not
-// be derived from pom.xml - the Maven and Gradle Spotless plugins use separate
-// version lines. See MIGRATION.md.
+// The plugin id is made available by settings.gradle (pluginManagement.plugins,
+// which supplies the version) plus `id 'com.diffplug.spotless' apply false` in
+// the root build.gradle, which puts it on the root buildscript classpath that
+// subprojects inherit. An earlier revision used a buildscript {} block in this
+// script instead; that adds the jar to THIS script's classloader only, while
+// `apply plugin: '<id>'` resolves ids against the target project's classpath, so
+// it failed with "Plugin with id 'com.diffplug.spotless' not found".
 // ===========================================================================
-
-buildscript {
-    repositories {
-        gradlePluginPortal()
-        mavenCentral()
-    }
-    dependencies {
-        classpath "com.diffplug.spotless:spotless-plugin-gradle:${spotlessVersion}"
-    }
-}
 
 apply plugin: 'com.diffplug.spotless'
 

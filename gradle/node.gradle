@@ -11,8 +11,44 @@
 // ===========================================================================
 
 def isWindows = System.getProperty('os.name').toLowerCase().contains('windows')
-ext.useSystemNode = project.hasProperty('useSystemNode') &&
-        project.property('useSystemNode').toString().toBoolean()
+
+// Prefer a usable Node already on PATH, and only download one when there is
+// none. The Maven goal downloaded unconditionally, but its purpose was "a
+// working Node is present", not "a Node was downloaded" - and build agents such
+// as devxci/mbtci-java21-node20 already ship one, while nodejs.org is often
+// unreachable from them. -PuseSystemNode=true|false forces either path.
+def detectSystemNode = {
+    try {
+        def process = new ProcessBuilder([isWindows ? 'node.exe' : 'node', '--version'])
+                .redirectErrorStream(true).start()
+        def output = process.inputStream.text.trim()
+        process.waitFor()
+        if (process.exitValue() != 0) {
+            return null
+        }
+        def matcher = (output =~ /v?(\d+)\./)
+        return matcher.find() ? [version: output, major: matcher.group(1) as Integer] : null
+    } catch (Exception ignored) {
+        return null
+    }
+}
+
+def requestedSystemNode = project.hasProperty('useSystemNode') ?
+        project.property('useSystemNode').toString().toBoolean() : null
+def minimumNodeMajor = (project.findProperty('nodeMinimumMajor') ?: '20') as Integer
+def systemNode = requestedSystemNode == false ? null : detectSystemNode()
+
+ext.useSystemNode = requestedSystemNode != null ? requestedSystemNode :
+        (systemNode != null && systemNode.major >= minimumNodeMajor)
+
+if (useSystemNode) {
+    logger.lifecycle("Using Node.js from PATH${systemNode ? " (${systemNode.version})" : ''}")
+} else if (systemNode != null) {
+    logger.lifecycle("Node.js ${systemNode.version} on PATH is older than the required major ${minimumNodeMajor}; " +
+            "a local Node ${nodeVersion} will be provisioned")
+} else {
+    logger.lifecycle("No Node.js on PATH; a local Node ${nodeVersion} will be provisioned into ./node")
+}
 
 def nodeHome = rootProject.layout.projectDirectory.dir('node').asFile
 ext.nodeHome = nodeHome

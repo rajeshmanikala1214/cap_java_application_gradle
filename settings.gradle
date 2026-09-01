@@ -7,6 +7,8 @@ pluginManagement {
         // Replaces the <parent>spring-boot-starter-parent</parent> of the root pom
         id 'org.springframework.boot'        version "${springBootVersion}"
         id 'io.spring.dependency-management' version "${springDependencyManagementVersion}"
+        // Declared here so the id resolves through Gradle's plugin management.
+        id 'com.diffplug.spotless'           version "${spotlessVersion}"
     }
 }
 
