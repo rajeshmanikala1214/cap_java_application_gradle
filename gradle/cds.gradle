@@ -26,6 +26,13 @@ def schemaH2File = file('src/main/resources/schema-h2.sql')
 def openapiFile = file('src/main/resources/swagger/openapi.json')
 def generatedSourcesDir = layout.buildDirectory.dir('generated/sources/cds/main/java')
 
+// cds4j-codegen emits more than .java files: alongside the sources it writes
+// META-INF/cds4j-codegen/services.generated, the index that the CAP runtime
+// (TypedCqnServiceFactory) reads to wrap each service with its generated
+// interface. That file has to reach the runtime classpath, so cdsGenerate
+// collects it here and the directory is a resource root of the main source set.
+def generatedResourcesDir = layout.buildDirectory.dir('generated/resources/cds/main')
+
 // Every .cds file that can influence the compiled model, plus the imported
 // EDMX and the CDS configuration.
 // Rooted at the individual model folders rather than the repository root, and
@@ -467,6 +474,7 @@ tasks.register('cdsGenerate') {
     inputs.dir codegenDriverSource
     inputs.property 'settings', codegenSettings.toString()
     outputs.dir generatedSourcesDir
+    outputs.dir generatedResourcesDir
 
     doLast {
         def outputDir = generatedSourcesDir.get().asFile
@@ -493,6 +501,31 @@ tasks.register('cdsGenerate') {
                             discoverCodegenEntryPoints(configurations.cdsCodegen.files)))
         }
         logger.lifecycle("cdsGenerate produced ${generatedCount} Java source file(s) in ${codegenSettings.basePackage}")
+
+        // The driver's FileSystem sink uses the Maven layout, which puts generated
+        // resources under <out>/resources rather than next to the sources. Only
+        // <out> is a Java source root, so that subtree would never be packaged.
+        // Both layouts are collected here, because the driver falls back to the
+        // flat one if the Maven layout ever stops writing.
+        def resourcesOut = generatedResourcesDir.get().asFile
+        delete resourcesOut
+        resourcesOut.mkdirs()
+        copy {
+            from(outputDir) { include 'META-INF/**' }
+            from(new File(outputDir, 'resources')) { include 'META-INF/**' }
+            into resourcesOut
+        }
+
+        def servicesIndex = new File(resourcesOut, 'META-INF/cds4j-codegen/services.generated')
+        if (!servicesIndex.isFile()) {
+            throw new GradleException("The code generator produced no META-INF/cds4j-codegen/" +
+                    "services.generated under ${outputDir}. Without that index the CAP runtime " +
+                    "cannot wrap a service with its generated interface, and injecting one " +
+                    "(for example @Qualifier(ApiBusinessPartner_.CDS_NAME) ApiBusinessPartner) " +
+                    "fails at startup with NoSuchBeanDefinitionException.")
+        }
+        logger.lifecycle("cdsGenerate wrote ${servicesIndex.readLines().size()} generated service " +
+                "interface(s) to META-INF/cds4j-codegen/services.generated")
     }
 }
 
@@ -538,10 +571,16 @@ sourceSets {
         java {
             srcDir generatedSourcesDir
         }
+        resources {
+            srcDir generatedResourcesDir
+        }
     }
 }
 
-tasks.named('processResources') { dependsOn tasks.named('cdsBuild') }
+tasks.named('processResources') {
+    dependsOn tasks.named('cdsBuild')
+    dependsOn tasks.named('cdsGenerate')
+}
 tasks.named('compileJava') { dependsOn tasks.named('cdsGenerate') }
 
 // ---------------------------------------------------------------------------
