@@ -59,6 +59,10 @@ dependencies {
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'org.springframework.security:spring-security-test'
     testImplementation 'org.springframework.boot:spring-boot-starter-webflux'
+    // CdsErrorStatuses lives in cds-services-utils, which cds-starter-spring-boot
+    // pulls in only at runtime scope. Maven put runtime-scoped transitives on the
+    // test-compile classpath, Gradle's testCompileClasspath does not.
+    testImplementation 'com.sap.cds:cds-services-utils'
 
     // --- dev tools (<optional>true</optional> in the pom) ---
     developmentOnly 'org.springframework.boot:spring-boot-devtools'
